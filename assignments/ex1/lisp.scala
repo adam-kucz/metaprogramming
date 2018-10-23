@@ -20,6 +20,7 @@ object ast {
     }
   }
   case class F(f: Value => Value) extends Value               // Procedures
+  case class Fsubr(fsubr: (Value,Env,Cont) => Value) extends Value
 
   // Env is a list of frames (each a list of key/value pairs)
   // We use object structures for easy reification/reflection.
@@ -43,62 +44,27 @@ object eval {
   def base_eval(exp: Value, env: Env, cont: Cont): Value = debug(s"eval ${pp.show(exp)}", env, cont) { (cont) =>
     exp match {
       case I(_) | B(_) => cont.f(exp)
-      case S(sym) => eval_var(exp, env, cont)
-      case P(S("quote"), _) => eval_quote(exp, env, cont)
-      case P(S("if"), _) => eval_if(exp, env, cont)
-      case P(S("set!"), _) => eval_set_bang(exp, env, cont)
-      case P(S("lambda"), _) => eval_lambda(exp, env, cont)
-      case P(S("begin"), body) => eval_begin(body, env, cont)
-      case P(S("define"), _) => eval_define(exp, env, cont)
-      case P(fun, args) => eval_application(exp, env, cont)
+      case S(_) => eval_var(exp, env, cont)
+      // case P(S("quote"), _) => eval_quote(exp, env, cont)
+      // case P(S("if"), _) => eval_if(exp, env, cont)
+      // case P(S("set!"), _) => eval_set_bang(exp, env, cont)
+      // case P(S("lambda"), _) => eval_lambda(exp, env, cont)
+      // case P(S("begin"), body) => eval_begin(body, env, cont)
+      // case P(S("define"), _) => eval_define(exp, env, cont)
+      case P(_, _) => eval_application(exp, env, cont)
     }
   }
 
   def eval_var(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case S(x) => cont.f(get(env, x))
-  }
-
-  def eval_quote(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case P(_, P(x, N)) => cont.f(x)
-  }
-
-  def eval_if(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case P(_, P(c, P(a, P(b, N)))) => base_eval(c, env, F{ cv => cv match {
-      case B(false) => base_eval(b, env, cont)
-      case B(true) => base_eval(a, env, cont)
-    }})
-  }
-
-  def eval_set_bang(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case P(_, P(S(x), P(rhs, N))) => base_eval(rhs, env, F{ v =>
-      cont.f(set(env, x, v))
-    })
-  }
-
-  def eval_lambda(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case P(_, P(params, body)) => cont.f(F({args =>
-      eval_begin(body, extend(env, params, args), F{v => v})
-    }))
-  }
-
-  def eval_begin(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case P(e, N) => base_eval(e, env, cont)
-    case P(e, es) => base_eval(e, env, F{ _ => eval_begin(es, env, cont) })
-  }
-
-  def eval_define(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case P(_, P(r@S(name), body)) => {
-      val p = P(r,Undefined)
-      env.car = P(p, env.car)
-      eval_begin(body, env, F{v =>
-        p.cdr = v
-        cont.f(r)})
+    case S(x) => {
+      cont.f(get(env, x))
     }
   }
 
   def eval_application(exp: Value, env: Env, cont: Cont): Value = exp match {
     case P(fun, args) => base_eval(fun, env, F{ vf => vf match {
       case F(f) => evlist(args, env, F{ vas => cont.f(f(vas)) })
+      case Fsubr(fsubr) => fsubr(exp, env, cont)
     }})
   }
 
@@ -114,7 +80,8 @@ object eval {
 
   def findFrame(frame: Value, x: String): Option[P] = frame match {
     case N => None
-    case P(P(S(y),_), _) if (x==y) => Some(frame.asInstanceOf[P].car.asInstanceOf[P])
+    case P(P(a@S(y),b), _) if (x==y) => Some(P(a,b))
+    // case P(P(S(y),_), _) if (x==y) => Some(frame.asInstanceOf[P].car.asInstanceOf[P])
     case P(_, rest) => findFrame(rest, x)
   }
   def find(env: Env, x: String): P = env match {
@@ -133,27 +100,168 @@ object eval {
     v
   }
 
-  def make_init_env() = {
-    lazy val init_env: Env = P(valueOf(List(
-      P(S("eq?"), F({args => args match { case P(a, P(b, N)) => B(a==b) }})))), N)
+  def builtin_numeric(symbol: String, f: (Int, Int) => Value): P =
+    P(S(symbol),
+      F({ case P(I(n1), P(I(n2), N)) => f(n1,n2)})
+    )
+
+  def builtin_special(symbol: String, f: (Value, Env, Cont) => Value): P =
+    P(S(symbol),
+      Fsubr(f)
+    )
+
+
+  def eval_quote(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_, P(x, N)) => cont.f(x)
+  }
+
+  def eval_if(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_, P(c, P(a, P(b, N)))) => base_eval(c, env, F{ cv => cv match {
+      case B(false) => base_eval(b, env, cont)
+      case B(true) => base_eval(a, env, cont)
+    }})
+  }
+
+  def eval_set_bang(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_, P(S(x), P(rhs, N))) => base_eval(rhs, env, F{ v =>
+      cont.f(set(env, x, v))
+    })
+  }
+
+  def eval_begin(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(e, N) => base_eval(e, env, cont)
+    case P(e, es) => base_eval(e, env, F{ _ => eval_begin(es, env, cont) })
+  }
+
+  def eval_define(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_, P(r@S(name), body)) => {
+      val p = P(r,Undefined)
+      env.car = P(p, env.car)
+      eval_begin(body, env, F{v =>
+        p.cdr = v
+        cont.f(r)})
+    }
+  }
+
+  def eval_lambda(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_, P(params, body)) => cont.f(F({args =>
+      eval_begin(body, extend(env, params, args), F{v => v})
+    }))
+  }
+
+  def eval_fsubr(exp: Value, env: Env, cont: Cont): Value = {
+    // System.err.println("eval fsubr for " + exp)
+    exp match {
+      case P(_, P(params, body)) =>
+        cont.f(Fsubr({(exp_arg,env_arg,cont_arg) => {
+          val args = valueOf(List(exp_arg, env_arg, cont_arg))
+          // System.err.println("fsubr app args: " + params + " --- ")
+          val fsubr_env = extend(env, params, args)
+          // System.err.println("fsubr exp: " + exp)
+          // System.err.println("fsubr full env: " + env)
+          // env match {
+          //   case P(fst,_) => System.err.println("fsubr local env: " + fst)
+          // }
+          eval_begin(body, fsubr_env, F{v => v})
+        }}))
+    }
+  }
+
+  def ev_in_env(s: String, env: Env): Value =
+    base_eval(repl.parse(s), env, F{ v => v })
+
+  val empty_env: Env = P(N,N)
+  def init_ev(s: String): Value = ev_in_env(s, empty_env)
+
+  def add_to_first_frame(env: Env, elem: P): Env = {
+    val P(frame,rest) = env
+    P(valueOf(list(frame) :+ elem), rest)
+  }
+
+  def rec_extend_env(env0: Env, defs: List[(String,String)]): Env = {
+    defs.foldLeft(env0) { case (env,(name,expr)) =>
+      val new_elem = P(S(name), ev_in_env(expr, env))
+      add_to_first_frame(env, new_elem)
+    }
+  }
+
+  def make_init_env(): Env = {
+    lazy val builtin_env: Env = P(
+      valueOf(List(
+        P(S("eq?"), F({args => args match { case P(a, P(b, N)) => B(a==b) }})),
+        P(S("car"), F({ case P(ls, N) => ls match {
+          case P(a,_) => a
+          case _      => N
+        }})),
+        P(S("cdr"), F({ case P(ls, N) => ls match {
+          case P(_,b) => b
+          case _      => N
+        }})),
+        P(S("t"), B(true)),
+        P(S("f"), B(false)),
+        builtin_numeric("<", (a: Int, b: Int) => B(a<b)),
+        builtin_numeric("*", (a: Int, b: Int) => I(a*b)),
+        builtin_numeric("-", (a: Int, b: Int) => I(a-b)),
+        builtin_special("fsubr", eval_fsubr),
+        // almost impossible to implement in object language
+        // would require both functions and environment machinery
+        // decided against trying
+        builtin_special("define", eval_define),
+        // diffficult to implement in object language, would require
+        // briging the whole evaluation machinery into object language
+        // decided against it
+        builtin_special("lambda", eval_lambda),
+        builtin_special("begin", eval_begin),
+        // could implement in object language with fsubr and church encoding,
+        // decided against it
+        builtin_special("if", eval_if),
+        // could implement in object language with fsubr
+        // if environment lookup functions were brought into object language
+        // for now decided against it
+        builtin_special("set!", eval_set_bang),
+      )),
+      N)
+    lazy val init_env: Env = rec_extend_env(builtin_env,List(
+      ("quote", "(fsubr (exp env cont) cont (cdr exp))"),
+      ("eval", "(lambda (x) x)")
+    ))
+    init_env
+  }
+
+  def make_init_env_old(): Env = {
+    lazy val init_env: Env = P(
+      valueOf(List(
+        P(S("eq?"), F({args => args match { case P(a, P(b, N)) => B(a==b) }})),
+        builtin_numeric("<", (a: Int, b: Int) => B(a<b)),
+        builtin_numeric("*", (a: Int, b: Int) => I(a*b)),
+        builtin_numeric("-", (a: Int, b: Int) => I(a-b)),
+        builtin_special("fsubr", eval_fsubr),
+        builtin_special("quote", eval_quote),
+        builtin_special("if", eval_if),
+        builtin_special("set!", eval_set_bang),
+        builtin_special("lambda", eval_lambda),
+        builtin_special("begin", eval_begin),
+        builtin_special("define", eval_define)
+      )),
+      N)
     init_env
   }
 }
 
 import scala.util.parsing.combinator._
 object parser extends JavaTokenParsers with PackratParsers {
-    def exp: Parser[Value] =
-      "#f" ^^ { case _ => B(false) } |
-      "#t" ^^ { case _ => B(true) } |
-      wholeNumber ^^ { case s => I(s.toInt) } |
-      """[^\s\(\)'"]+""".r ^^ { case s => S(s) } |
-      "'" ~> exp ^^ { case s => P(S("quote"), P(s, N)) } |
-      "()" ^^ { case _ => N } |
-      "(" ~> exps <~ ")" ^^ { case vs => vs }
+  def exp: Parser[Value] =
+    "#f" ^^ { case _ => B(false) } |
+  "#t" ^^ { case _ => B(true) } |
+  wholeNumber ^^ { case s => I(s.toInt) } |
+  """[^\s\(\)'"]+""".r ^^ { case s => S(s) } |
+  "'" ~> exp ^^ { case s => P(S("quote"), P(s, N)) } |
+  "()" ^^ { case _ => N } |
+  "(" ~> exps <~ ")" ^^ { case vs => vs }
 
   def exps: Parser[Value] =
-      exp ~ exps ^^ { case v~vs => P(v, vs) } |
-      exp ^^ { case v => P(v, N) }
+    exp ~ exps ^^ { case v~vs => P(v, vs) } |
+  exp ^^ { case v => P(v, N) }
 }
 
 import eval._
@@ -198,7 +306,7 @@ import repl._
 import pp._
 import utils._
 class lisp_Tests extends TestSuite {  before { clean() }
-  ignore("(factorial 6)") {
+  test("(factorial 6)") {
     ev("""(define factorial (lambda (n) (if (< n 2) n (* n (factorial (- n 1))))))""")
     assertResult(I(720))(ev("(factorial 6)"))
   }
@@ -241,7 +349,7 @@ class lisp_Tests extends TestSuite {  before { clean() }
     ev("(define history '())")
     assertResult(N)(ev("history"))
     assertResult(show(P(I(4), N)))(show(ev("(cons 4 history)")))
-   }
+  }
 
   ignore("fexpr history") {
     ev("(define history '())")
@@ -261,16 +369,16 @@ class lisp_Tests extends TestSuite {  before { clean() }
     assertResult("((test 2 4) (test 1 2))")(show(ev("history")))
   }
 
-  ignore("fsubr") {
-     ev("(define my-exp (fsubr (exp env cont) exp))")
-     assertResult("(my-exp x)")(show(ev("(my-exp x)")))
-     ev("(define jump (fsubr (exp env cont) (eval (car (cdr exp)))))")
-     assertResult(I(2))(ev("(- 1 (jump 2))"))
-     ev("(define fall (fsubr (exp env cont) 1))")
-     assertResult(I(1))(ev("(* 2 (fall))"))
-     // NOTE: to work nicely with composing continuations,
-     // we would have to adjust the calling conventions...
-   }
+  test("fsubr") {
+    ev("(define my-exp (fsubr (exp env cont) exp))") // aka 'exit with itself'
+    assertResult("(my-exp x)")(show(ev("(my-exp x)")))
+    ev("(define jump (fsubr (exp env cont) (eval (car (cdr exp)))))")
+    assertResult(I(2))(ev("(- 1 (jump 2))"))
+    ev("(define fall (fsubr (exp env cont) 1))") // aka 'exit with 1'
+    assertResult(I(1))(ev("(* 2 (fall))"))
+    // NOTE: to work nicely with composing continuations,
+    // we would have to adjust the calling conventions...
+  }
 
   ignore("fsubr history") {
     ev("(define old-set! set!)")
@@ -327,8 +435,8 @@ object debug {
   implicit class EnvDeco(val env: Env) extends AnyVal {
     def format: String =
       "---------env-------\n" ++
-      list(env).map(formatFrame).mkString("\n") ++
-      "\n---------env-------\n"
+    list(env).map(formatFrame).mkString("\n") ++
+    "\n---------env-------\n"
 
     def formatFrame(frame: Value): String = list(frame).map {
       case P(S(name), body) => name + " -> " + body
