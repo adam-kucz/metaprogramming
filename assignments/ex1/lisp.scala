@@ -21,6 +21,7 @@ object ast {
   }
   case class F(f: Value => Value) extends Value               // Procedures
   case class Fsubr(fsubr: (Value,Env,Cont) => Value) extends Value
+  case class Fexpr(fexp: Value => Value) extends Value
 
   // Env is a list of frames (each a list of key/value pairs)
   // We use object structures for easy reification/reflection.
@@ -56,16 +57,29 @@ object eval {
   }
 
   def eval_var(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case S(x) => {
-      cont.f(get(env, x))
-    }
+    case S(x) => cont.f(get(env, x))
   }
 
   def eval_application(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case P(fun, args) => base_eval(fun, env, F{ vf => vf match {
-      case F(f) => evlist(args, env, F{ vas => cont.f(f(vas)) })
-      case Fsubr(fsubr) => fsubr(exp, env, cont)
-    }})
+    case P(fun, args) => {
+      base_eval(fun, env, F{ vf => vf match {
+        case F(f) => evlist(args, env, F{ vas => cont.f(f(vas)) })
+        case Fsubr(fsubr) => fsubr(exp, env, cont)
+        case Fexpr(fexp) => cont.f(fexp(args))
+      }})
+    }
+  }
+
+  def eval_eval(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_,P(arg,N)) =>
+      // because argument should be evaluated before being passed to a call
+      base_eval(arg, env, F { v =>
+        // because that's what eval does
+        base_eval(v, env, cont)})
+  }
+
+  def eval_list(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_,args) => evlist(args, env, cont)
   }
 
   def evlist(exp: Value, env: Env, cont: Cont): Value = exp match {
@@ -80,8 +94,7 @@ object eval {
 
   def findFrame(frame: Value, x: String): Option[P] = frame match {
     case N => None
-    case P(P(a@S(y),b), _) if (x==y) => Some(P(a,b))
-    // case P(P(S(y),_), _) if (x==y) => Some(frame.asInstanceOf[P].car.asInstanceOf[P])
+    case P(P(S(y),_), _) if (x==y) => Some(frame.asInstanceOf[P].car.asInstanceOf[P])
     case P(_, rest) => findFrame(rest, x)
   }
   def find(env: Env, x: String): P = env match {
@@ -105,10 +118,8 @@ object eval {
       F({ case P(I(n1), P(I(n2), N)) => f(n1,n2)})
     )
 
-  def builtin_special(symbol: String, f: (Value, Env, Cont) => Value): P =
-    P(S(symbol),
-      Fsubr(f)
-    )
+  def builtin_fsubr(symbol: String, f: (Value, Env, Cont) => Value): P =
+    P(S(symbol), Fsubr(f))
 
 
   def eval_quote(exp: Value, env: Env, cont: Cont): Value = exp match {
@@ -128,9 +139,11 @@ object eval {
     })
   }
 
-  def eval_begin(exp: Value, env: Env, cont: Cont): Value = exp match {
-    case P(e, N) => base_eval(e, env, cont)
-    case P(e, es) => base_eval(e, env, F{ _ => eval_begin(es, env, cont) })
+  def eval_begin(exp: Value, env: Env, cont: Cont): Value = {
+    exp match {
+      case P(e, N) => base_eval(e, env, cont)
+      case P(e, es) => base_eval(e, env, F{ _ => eval_begin(es, env, cont) })
+    }
   }
 
   def eval_define(exp: Value, env: Env, cont: Cont): Value = exp match {
@@ -149,22 +162,25 @@ object eval {
     }))
   }
 
-  def eval_fsubr(exp: Value, env: Env, cont: Cont): Value = {
-    // System.err.println("eval fsubr for " + exp)
-    exp match {
-      case P(_, P(params, body)) =>
-        cont.f(Fsubr({(exp_arg,env_arg,cont_arg) => {
-          val args = valueOf(List(exp_arg, env_arg, cont_arg))
-          // System.err.println("fsubr app args: " + params + " --- ")
-          val fsubr_env = extend(env, params, args)
-          // System.err.println("fsubr exp: " + exp)
-          // System.err.println("fsubr full env: " + env)
-          // env match {
-          //   case P(fst,_) => System.err.println("fsubr local env: " + fst)
-          // }
-          eval_begin(body, fsubr_env, F{v => v})
-        }}))
-    }
+  def eval_fexpr(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_, P(params, body)) => cont.f(Fexpr({args =>
+      eval_begin(body, extend(env, params, args), F{v => v})
+    }))
+  }
+
+  def eval_fsubr(exp: Value, env: Env, cont: Cont): Value = exp match {
+    case P(_, P(params, body)) =>
+      cont.f(Fsubr({(exp_arg,env_arg,cont_arg) => {
+        val args = valueOf(List(
+          exp_arg,
+          env_arg,
+          // in user code cont can only be called as (cont v)
+          // which results in (v) [1-element list with v]
+          // being passed as argument, we have to strip it back to v here
+          F { case P(v,N) => cont_arg.f(v) }
+        ))
+        eval_begin(body, extend(env, params, args), F{v => v})
+      }}))
   }
 
   def ev_in_env(s: String, env: Env): Value =
@@ -188,42 +204,46 @@ object eval {
   def make_init_env(): Env = {
     lazy val builtin_env: Env = P(
       valueOf(List(
-        P(S("eq?"), F({args => args match { case P(a, P(b, N)) => B(a==b) }})),
-        P(S("car"), F({ case P(ls, N) => ls match {
+        P(S("eq?"), F { case P(a, P(b, N)) => B(a==b) }),
+        P(S("car"), F { case P(ls, N) => ls match {
           case P(a,_) => a
           case _      => N
-        }})),
-        P(S("cdr"), F({ case P(ls, N) => ls match {
+        }}),
+        P(S("cdr"), F { case P(ls, N) => ls match {
           case P(_,b) => b
           case _      => N
-        }})),
-        P(S("t"), B(true)),
-        P(S("f"), B(false)),
+        }}),
+        P(S("cons"), F { case P(h, P(t, N)) => P(h,t) }),
+        // P(S("t"), B(true)),
+        // P(S("f"), B(false)),
         builtin_numeric("<", (a: Int, b: Int) => B(a<b)),
         builtin_numeric("*", (a: Int, b: Int) => I(a*b)),
         builtin_numeric("-", (a: Int, b: Int) => I(a-b)),
-        builtin_special("fsubr", eval_fsubr),
+        builtin_fsubr("fsubr", eval_fsubr),
         // almost impossible to implement in object language
         // would require both functions and environment machinery
         // decided against trying
-        builtin_special("define", eval_define),
+        builtin_fsubr("define", eval_define),
         // diffficult to implement in object language, would require
         // briging the whole evaluation machinery into object language
         // decided against it
-        builtin_special("lambda", eval_lambda),
-        builtin_special("begin", eval_begin),
+        builtin_fsubr("lambda", eval_lambda),
+        builtin_fsubr("list", eval_list),
+        builtin_fsubr("fexpr", eval_fexpr),
+        builtin_fsubr("eval", eval_eval),
+        builtin_fsubr("begin", eval_begin),
         // could implement in object language with fsubr and church encoding,
         // decided against it
-        builtin_special("if", eval_if),
+        builtin_fsubr("if", eval_if),
         // could implement in object language with fsubr
         // if environment lookup functions were brought into object language
         // for now decided against it
-        builtin_special("set!", eval_set_bang),
+        builtin_fsubr("set!", eval_set_bang)
       )),
       N)
     lazy val init_env: Env = rec_extend_env(builtin_env,List(
-      ("quote", "(fsubr (exp env cont) cont (cdr exp))"),
-      ("eval", "(lambda (x) x)")
+      ("cadr", "(lambda (__cadr_x) (car (cdr __cadr_x)))"),
+      ("quote", "(fsubr (exp env cont) (cont (cadr exp)))"),
     ))
     init_env
   }
@@ -235,13 +255,13 @@ object eval {
         builtin_numeric("<", (a: Int, b: Int) => B(a<b)),
         builtin_numeric("*", (a: Int, b: Int) => I(a*b)),
         builtin_numeric("-", (a: Int, b: Int) => I(a-b)),
-        builtin_special("fsubr", eval_fsubr),
-        builtin_special("quote", eval_quote),
-        builtin_special("if", eval_if),
-        builtin_special("set!", eval_set_bang),
-        builtin_special("lambda", eval_lambda),
-        builtin_special("begin", eval_begin),
-        builtin_special("define", eval_define)
+        builtin_fsubr("fsubr", eval_fsubr),
+        builtin_fsubr("quote", eval_quote),
+        builtin_fsubr("if", eval_if),
+        builtin_fsubr("set!", eval_set_bang),
+        builtin_fsubr("lambda", eval_lambda),
+        builtin_fsubr("begin", eval_begin),
+        builtin_fsubr("define", eval_define)
       )),
       N)
     init_env
@@ -311,13 +331,13 @@ class lisp_Tests extends TestSuite {  before { clean() }
     assertResult(I(720))(ev("(factorial 6)"))
   }
 
-  ignore("eq?") {
+  test("eq?") {
     assertResult(B(true))(ev("(eq? 1 1)"))
     assertResult(B(false))(ev("(eq? 1 2)"))
     assertResult(B(false))(ev("(eq? (list 1) (list 1))"))
   }
 
-  ignore("(odd 7)") {
+  test("(odd 7)") {
     ev("""(begin
 (define even (lambda (n) (if (eq? n 0) #t (odd (- n 1)))))
 (define odd (lambda (n) (if (eq? n 0) #f (even (- n 1)))))
@@ -325,18 +345,18 @@ class lisp_Tests extends TestSuite {  before { clean() }
     assertResult(B(true))(ev("(odd 7)"))
   }
 
-  ignore("eval") {
+  test("eval") {
     ev("(define x 1)")
     assertResult(I(1))(ev("(eval 'x)"))
     assertResult(I(2))(ev("(* (eval 'x) 2)"))
   }
 
-  ignore("fexpr if") {
+  test("fexpr if") {
     ev("(define my-if (fexpr (c a b) (if (eval c) (eval a) (eval b))))")
     assertResult(I(1))(ev("(my-if #t 1 bad)"))
   }
 
-  ignore("list") {
+  test("list") {
     // NOTE: we use `show` to compare pairs,
     // to by-pass referential equality.
 
@@ -351,7 +371,7 @@ class lisp_Tests extends TestSuite {  before { clean() }
     assertResult(show(P(I(4), N)))(show(ev("(cons 4 history)")))
   }
 
-  ignore("fexpr history") {
+  test("fexpr history") {
     ev("(define history '())")
     ev("""(define save! (fexpr (lhs rhs)
    ((lambda (old-val)
@@ -380,7 +400,7 @@ class lisp_Tests extends TestSuite {  before { clean() }
     // we would have to adjust the calling conventions...
   }
 
-  ignore("fsubr history") {
+  test("fsubr history") {
     ev("(define old-set! set!)")
     ev("(define history '())")
     ev("""(define save! (fexpr (lhs rhs)
